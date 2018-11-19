@@ -1,0 +1,13 @@
+sudo: required
+services:
+- docker
+git:
+  submodules: false
+before_install:
+- sudo apt-get update
+- echo 'DOCKER_OPTS="-H tcp://127.0.0.1:2375 -H unix:///var/run/docker.sock -s devicemapper"'
+  | sudo tee /etc/default/docker > /dev/null
+- sudo service docker restart
+- sleep 5
+script:
+- travis_wait 60 ./criteo-build.sh
