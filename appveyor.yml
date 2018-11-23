@@ -10,7 +10,7 @@ configuration:
 - Release
 environment:
   image_flag: 2015
-build_script: build.cmd -release -BuildTests=False 
+build_script: build.cmd -allconfigurations
 artifacts:
 - path: '**\*.nupkg'
 
