@@ -32,6 +32,8 @@ namespace System.Net.Sockets
 
     internal sealed class SocketAsyncContext
     {
+        private static SmartThreadPool IOThreadPool = new SmartThreadPool("IO ThreadPool", Environment.ProcessorCount * 2);
+
         // Cached operation instances for operations commonly repeated on the same socket instance,
         // e.g. async accepts, sends/receives with single and multiple buffers.  More can be
         // added in the future if necessary, at the expense of extra fields here.  With a larger
@@ -249,7 +251,7 @@ namespace System.Net.Sockets
                     // we can't pool the object, as ProcessQueue may still have a reference to it, due to
                     // using a pattern whereby it takes the lock to grab an item, but then releases the lock
                     // to do further processing on the item that's still in the list.
-                    ThreadPool.UnsafeQueueUserWorkItem(o => ((AsyncOperation)o).InvokeCallback(allowPooling: false), this);
+                    IOThreadPool.QueueWorkItem(o => ((AsyncOperation)o).InvokeCallback(allowPooling: false), this);
                 }
 
                 Trace("Exit");
@@ -270,7 +272,8 @@ namespace System.Net.Sockets
                 else
                 {
                     // Async operation.  Process the IO on the threadpool.
-                    ThreadPool.UnsafeQueueUserWorkItem(processingCallback, this);
+                    //ThreadPool.UnsafeQueueUserWorkItem(processingCallback, this);
+                    IOThreadPool.QueueWorkItem(processingCallback, this);
                 }
             }
 
@@ -302,12 +305,12 @@ namespace System.Net.Sockets
 
         // These two abstract classes differentiate the operations that go in the
         // read queue vs the ones that go in the write queue.
-        private abstract class ReadOperation : AsyncOperation 
+        private abstract class ReadOperation : AsyncOperation
         {
             public ReadOperation(SocketAsyncContext context) : base(context) { }
         }
 
-        private abstract class WriteOperation : AsyncOperation 
+        private abstract class WriteOperation : AsyncOperation
         {
             public WriteOperation(SocketAsyncContext context) : base(context) { }
         }
@@ -509,7 +512,7 @@ namespace System.Net.Sockets
             public int BytesTransferred;
             public SocketFlags ReceivedFlags;
             public IList<ArraySegment<byte>> Buffers;
-            
+
             public bool IsIPv4;
             public bool IsIPv6;
             public IPPacketInformation IPPacketInformation;
@@ -838,7 +841,7 @@ namespace System.Net.Sockets
                 // Dispatch the op so we can try to process it.
                 op.Dispatch(s_processingCallback);
             }
-            
+
             private void ProcessAsyncOperation(TOperation op)
             {
                 OperationResult result = ProcessQueuedOperation(op);
@@ -1154,7 +1157,7 @@ namespace System.Net.Sockets
             _receiveQueue.StopAndAbort(this);
 
             lock (_registerLock)
-            { 
+            {
                 // Freeing the token will prevent any future event delivery.  This socket will be unregistered
                 // from the event port automatically by the OS when it's closed.
                 _asyncEngineToken.Free();
@@ -1463,7 +1466,7 @@ namespace System.Net.Sockets
             }
         }
 
-        public SocketError ReceiveFromAsync(Memory<byte> buffer,  SocketFlags flags, byte[] socketAddress, ref int socketAddressLen, out int bytesReceived, out SocketFlags receivedFlags, Action<int, byte[], int, SocketFlags, SocketError> callback)
+        public SocketError ReceiveFromAsync(Memory<byte> buffer, SocketFlags flags, byte[] socketAddress, ref int socketAddressLen, out int bytesReceived, out SocketFlags receivedFlags, Action<int, byte[], int, SocketFlags, SocketError> callback)
         {
             SetNonBlocking();
 
@@ -1761,7 +1764,7 @@ namespace System.Net.Sockets
                 ReturnOperation(operation);
                 return errorCode;
             }
-                
+
             return SocketError.IOPending;
         }
 
@@ -1950,4 +1953,1577 @@ namespace System.Net.Sockets
 
         public static string IdOf(object o) => o == null ? "(null)" : $"{o.GetType().Name}#{o.GetHashCode():X2}";
     }
+
+    public class SmartThreadPool : IDisposable
+    {
+        #region Private stuff
+
+        /// <summary>
+        /// The time of the last thread launch.
+        /// </summary>
+        private DateTime _threadLastRequest = DateTime.UtcNow;
+
+        /// <summary>
+        /// The count of launched threads.
+        /// </summary>
+        private int _slaveCount;
+
+        /// <summary>
+        /// Queue of work items.
+        /// </summary>
+        private readonly WorkItemQueue _workItemQueue = new WorkItemQueue();
+
+        #endregion
+
+        #region Instance
+
+        /// <summary>
+        /// The statistics instance.
+        /// </summary>
+        private readonly Instance _instance;
+
+        /// <summary>
+        /// Gets the statistics instance.
+        /// </summary>
+        /// <value>The statistics instance.</value>
+        protected Instance Instance
+        {
+            get { return _instance; }
+        }
+
+        #endregion
+
+
+        #region New
+
+        /// <summary>
+        /// Constructor
+        /// </summary>
+        /// <param name="name">The name.</param>
+        /// <param name="maximumThreads">The maximum threads.</param>
+        /// <param name="minimumThreads">The minimum threads.</param>
+        public SmartThreadPool(
+            string name,
+            int threads)
+        {
+            if (string.IsNullOrEmpty(name))
+            {
+                throw new ArgumentNullException("name");
+            }
+            if (threads <= 0)
+            {
+                throw new ArgumentOutOfRangeException("threads", "threads must be greater than zero");
+            }
+
+            _instance =
+                new Instance(
+                    1,
+                    name,
+                    threads,
+                    threads);
+
+            // No control thread, just start the slave threads now
+            ProcessMaster();
+        }
+
+        #endregion
+
+        #region Thread Processing
+
+        private void ProcessMaster()
+        {
+            //  Count
+            int currentThreads = CurrentThreads;
+            int currentWorkers = CurrentWorkers;
+            int currentQueue = CurrentQueue;
+
+            //  Determines the requested threads to launch
+            int requestedThreads = 0;
+            if (currentThreads < MinimumThreads)
+            {
+                requestedThreads = MinimumThreads;
+            }
+            else if (currentThreads - currentWorkers < currentQueue)
+            {
+                requestedThreads = (int)Math.Sqrt(currentQueue);
+            }
+            if (requestedThreads > 0)
+            {
+                _threadLastRequest = DateTime.UtcNow;
+            }
+
+            //  Launch the requested threads
+            if (requestedThreads > 0 && currentThreads < MaximumThreads)
+            {
+                for (int index = 0; index < requestedThreads; index++)
+                {
+                    if (Instance.Slaves < MaximumThreads)
+                    {
+                        var thread = new System.Threading.Thread(ProcessSlave);
+                        thread.Name =
+                            string.Format(
+                                @"SmartThreadPool[{0}, ""{1}""].Slave[{2}, ""{3:yyyy-MM-dd\THH:mm:ss.fff}""]", Id,
+                                Name, Interlocked.Increment(ref _slaveCount), _threadLastRequest);
+                        thread.IsBackground = true;
+                        thread.Start();
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Processes the thread.
+        /// </summary>
+        private void LoopProcessMaster()
+        {
+            //  Registers the master thread
+            Instance.RegisterCurrentThread(true);
+            try
+            {
+                // Process until shutdown.
+                while (!_disposed)
+                {
+                    try
+                    {
+                        ProcessMaster();
+                    }
+                    catch (Exception)
+                    {
+                        //  Unlucky
+                    }
+                    System.Threading.Thread.Sleep(1000);
+                }
+            }
+            finally
+            {
+                //  Unregisters the master thread
+                Instance.UnregisterCurrentThread(true);
+            }
+        }
+
+        /// <summary>
+        /// A worker thread method that processes work items from the work items queue.
+        /// </summary>
+        private void ProcessSlave()
+        {
+            //  Registers the slave thread
+            Instance.RegisterCurrentThread(false);
+            try
+            {
+                // Process until shutdown.
+                while (!_disposed)
+                {
+                    try
+                    {
+                        //  Wait for a work item, shutdown, or timeout
+                        var workItem = (MaximumThreads == MinimumThreads)
+                                                ? _workItemQueue.Dequeue() // Wait indefinitely
+                                                : _workItemQueue.Dequeue(30000);
+                        if (workItem != null)
+                        {
+                            Instance.DecrementSleepers();
+                        }
+
+                        //  Nothing to do
+                        if (null == workItem)
+                        {
+                            if (!_disposed && MaximumThreads > MinimumThreads &&
+                                Instance.Slaves > MinimumThreads)
+                            {
+                                if (DateTime.UtcNow.Subtract(_threadLastRequest).TotalSeconds > 60.0)
+                                {
+                                    break; // Stop
+                                }
+                            }
+                            continue; // Next
+                        }
+
+                        // else
+                        try
+                        {
+                            Instance.IncrementWorkers();
+                            try
+                            {
+                                workItem.Execute();
+                            }
+                            finally
+                            {
+                                Instance.DecrementWorkers();
+                            }
+                        }
+                        catch (Exception)
+                        {
+                            //  Unlucky
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        //  Unlucky
+                    }
+                }
+            }
+            finally
+            {
+                //  Unregisters the slave thread
+                Instance.UnregisterCurrentThread(false);
+            }
+        }
+
+        #endregion
+
+        #region Public Methods
+
+        /// <summary>
+        /// Queue a work item
+        /// </summary>
+        /// <param name="callback">A callback to execute</param>
+        /// <returns>Returns a work item result</returns>
+        public void QueueWorkItem(System.Threading.WaitCallback callback, object state)
+        {
+            QueueWorkItem(callback, state, __defaultGroup);
+        }
+
+        /// <summary>
+        /// Queue a work item
+        /// </summary>
+        /// <param name="callback">A callback to execute</param>
+        /// <param name="group">The group of the callback, for fair scheduling</param>
+        /// <param name="postCallback">The post callback</param>
+        /// <returns>Returns a work item result</returns>
+        public void QueueWorkItem(System.Threading.WaitCallback callback, object state, SchedulingGroup group)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException("SmartThreadPool", "The SmartThreadPool has been shutdown.");
+            }
+            var workItem = new WorkItem(Instance, callback, state);
+            Instance.IncrementSleepers();
+            Instance.IncrementForGroup(group);
+            _workItemQueue.Enqueue(workItem, group.Group);
+        }
+
+        #endregion
+
+        #region Public static services
+
+        /// <summary>
+        /// Generate a unique ID suitable for use as fair scheduling group.
+        /// </summary>
+        /// <returns>A unique ID</returns>
+        public static SchedulingGroup AssignGroup(string name)
+        {
+            return AssignGroup(name, 1);
+        }
+
+        /// <summary>
+        /// Generate a unique ID suitable for use as fair scheduling group.
+        /// </summary>
+        /// <returns>A unique ID</returns>
+        public static SchedulingGroup AssignGroup(string name, int weight)
+        {
+            return new SchedulingGroup(name, weight);
+        }
+
+        /// <summary>
+        /// The default scheduling group.
+        /// </summary>
+        public static SchedulingGroup DefaultGroup
+        {
+            get { return __defaultGroup; }
+        }
+
+        private static readonly SchedulingGroup __defaultGroup = AssignGroup("Default");
+
+        #endregion
+
+        #region Properties
+
+        /// <summary>
+        /// Gets the id.
+        /// </summary>
+        public int Id
+        {
+            get
+            {
+                return _instance.Id;
+            }
+        }
+        /// <summary>
+        /// Gets the name.
+        /// </summary>
+        public string Name
+        {
+            get
+            {
+                return _instance.Name;
+            }
+        }
+
+        public int Threads { get; }
+
+        /// <summary>
+        /// Gets the minimum threads.
+        /// </summary>
+        /// <value>The minimum threads.</value>
+        public int MinimumThreads
+        {
+            get
+            {
+                return Threads;
+            }
+        }
+        /// <summary>
+        /// Gets the maximum threads.
+        /// </summary>
+        /// <value>The maximum threads.</value>
+        public int MaximumThreads
+        {
+            get
+            {
+                return Threads;
+            }
+        }
+
+        /// <summary>
+        /// Get the number of threads in the thread pool.
+        /// Should be between the lower and the upper limits.
+        /// </summary>
+        public int CurrentThreads
+        {
+            get
+            {
+                return (int)Instance.Slaves;
+            }
+        }
+
+        /// <summary>
+        /// Get the number of busy (not idle) threads in the thread pool.
+        /// </summary>
+        public int CurrentWorkers
+        {
+            get
+            {
+                return (int)Instance.Workers;
+            }
+        }
+
+        /// <summary>
+        /// Get the number of work items in the queue.
+        /// </summary>
+        public int CurrentQueue
+        {
+            get
+            {
+                return (int)Instance.Sleepers;
+            }
+        }
+
+        #endregion
+
+        #region IDisposable Members
+
+        /// <summary>
+        /// The disposed flag.
+        /// </summary>
+        private bool _disposed;
+
+        /// <summary>
+        /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
+        /// </summary>
+        public virtual void Dispose()
+        {
+            //  Disposes managed and unmanaged resources
+            Dispose(true);
+
+            //  Suppress the finalize
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Releases unmanaged resources and performs other cleanup operations before the
+        /// <see cref="SmartThreadPool"/> is reclaimed by garbage collection.
+        /// </summary>
+        ~SmartThreadPool()
+        {
+            //  Disposes unmanaged resources
+            Dispose(false);
+        }
+
+        /// <summary>
+        /// Releases unmanaged and - optionally - managed resources
+        /// </summary>
+        /// <param name="disposing"><c>true</c> to release both managed and unmanaged resources; <c>false</c> to release only unmanaged resources.</param>
+        protected virtual void Dispose(bool disposing)
+        {
+            //  Checks the disposed flag
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+
+            //  Disposes the managed resources
+            if (disposing)
+            {
+                try
+                {
+                    //  Disposes the queue
+                    _workItemQueue.Dispose();
+                }
+                catch { }
+            }
+        }
+
+
+
+        #endregion
+
+
+
+    }
+
+    internal abstract class BaseWorkItem : IWorkItemResult
+    {
+        /// <summary>
+        /// The instance to monitor.
+        /// </summary>
+        private readonly Instance _instance;
+
+        /// <summary>
+        /// Hold the state of the work item
+        /// </summary>
+        private WorkItemStatus _workItemStatus = WorkItemStatus.Waiting;
+
+        /// <summary>
+        /// The tick for the state [Running].
+        /// </summary>
+        private int _tickRunning;
+
+        /// <summary>
+        /// The tick for the state [Waiting].
+        /// </summary>
+        private readonly int _tickWaiting = System.Environment.TickCount;
+
+        /// <summary>
+        /// The tick for the state [Completed/Canceled].
+        /// </summary>
+        private int _tickCompleted;
+
+        protected BaseWorkItem(Instance instance)
+        {
+            _instance = instance;
+        }
+
+        public Exception Exception { get; private set; }
+
+        /// <summary>
+        /// Returns true when the work item has completed or canceled
+        /// </summary>
+        public bool IsCompleted
+        {
+            get
+            {
+                lock (this)
+                {
+                    return FastIsCompleted || FastIsCanceled;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns true when the work item has canceled
+        /// </summary>
+        public bool IsCanceled
+        {
+            get
+            {
+                lock (this)
+                {
+                    return FastIsCanceled;
+                }
+            }
+        }
+
+        protected bool FastIsCompleted
+        {
+            get { return _workItemStatus == WorkItemStatus.Completed; }
+        }
+
+
+        protected bool FastIsCanceled
+        {
+            get { return _workItemStatus == WorkItemStatus.Canceled; }
+        }
+
+        /// <summary>
+        /// Waits this instance.
+        /// </summary>
+        /// <returns></returns>
+        public bool Wait()
+        {
+            return Wait(-1);
+        }
+
+        /// <summary>
+        /// Waits the specified timeout.
+        /// </summary>
+        /// <param name="timeout">The timeout.</param>
+        /// <returns></returns>
+        public bool Wait(TimeSpan timeout)
+        {
+            return Wait((int)timeout.TotalMilliseconds);
+        }
+
+        /// <summary>
+        /// Waits the specified milliseconds timeout.
+        /// </summary>
+        /// <param name="millisecondsTimeout">The milliseconds timeout.</param>
+        /// <returns></returns>
+        public bool Wait(int millisecondsTimeout)
+        {
+            // Check for cancel
+            if (_workItemStatus == WorkItemStatus.Canceled)
+            {
+                return false;
+            }
+
+            // Check for completion
+            if (_workItemStatus == WorkItemStatus.Completed)
+            {
+                return true;
+            }
+
+            //  Waits
+            lock (this)
+            {
+                if (_workItemStatus != WorkItemStatus.Canceled && _workItemStatus != WorkItemStatus.Completed)
+                {
+                    bool timeout = !Monitor.Wait(this, millisecondsTimeout);
+
+                    if (timeout)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            // Check for cancel
+            if (_workItemStatus == WorkItemStatus.Canceled)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Cancel the work item if it didn't start running yet.
+        /// </summary>
+        /// <returns>Returns true on success or false if the work item is in progress or already completed</returns>
+        public bool Cancel()
+        {
+            lock (this)
+            {
+                switch (_workItemStatus)
+                {
+                    case WorkItemStatus.Canceled:
+                        return true;
+                    case WorkItemStatus.Completed:
+                    case WorkItemStatus.Running:
+                        _instance.IncrementCancelFailures();
+                        return false;
+                    case WorkItemStatus.Waiting:
+                        _workItemStatus = WorkItemStatus.Canceled;
+                        _instance.IncrementCancelSuccesses();
+                        Monitor.PulseAll(this);
+                        return true;
+                    default:
+                        throw new NotSupportedException(string.Format("The work item state [{0}] is not expected.", _workItemStatus));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Execute the work item.
+        /// </summary>
+        public void Execute()
+        {
+            //  InQueue -> InProgress
+            lock (this)
+            {
+                switch (_workItemStatus)
+                {
+                    case WorkItemStatus.Canceled:
+                        return;
+
+                    case WorkItemStatus.Waiting:
+                        _workItemStatus = WorkItemStatus.Running;
+                        _tickRunning = System.Environment.TickCount;
+                        break;
+
+                    default:
+                        throw new NotSupportedException(string.Format("The work item state [{0}] is not expected.", _workItemStatus));
+                }
+            }
+
+            _instance.UpdateWaiting(_tickWaiting, _tickRunning);
+
+            //  Execute
+            try
+            {
+                CallbackExecute();
+            }
+            catch (Exception exception)
+            {
+                Exception = exception;
+            }
+
+            //  InProgress -> Completed
+            lock (this)
+            {
+                _workItemStatus = WorkItemStatus.Completed;
+                _tickCompleted = System.Environment.TickCount;
+                Monitor.PulseAll(this);
+            }
+
+            _instance.UpdateRunning(_tickRunning, _tickCompleted);
+
+            try
+            {
+                PostExecute();
+            }
+            catch { }
+        }
+
+        protected abstract void CallbackExecute();
+
+        protected abstract void PostExecute();
+    }
+
+    internal enum WorkItemStatus : byte
+    {
+        Waiting = 0,
+        Running = 1,
+        Completed = 2,
+        Canceled = 3
+    }
+
+    internal class WorkItem : BaseWorkItem
+    {
+        /// <summary>
+        /// Callback delegate for the callback.
+        /// </summary>
+        private readonly System.Threading.WaitCallback _callback;
+        private readonly object _state;
+
+        /// <summary>
+        /// Initialize the callback holding object.
+        /// </summary>
+        /// <param name="instance">The instance.</param>
+        /// <param name="callback">Callback delegate for the callback.</param>
+        /// <param name="postCallback"></param>
+        public WorkItem(Instance instance, System.Threading.WaitCallback callback, object state)
+            : base(instance)
+        {
+            _callback = callback;
+            _state = state;
+        }
+
+        protected override void CallbackExecute()
+        {
+            _callback(_state);
+        }
+
+        protected override void PostExecute()
+        {
+        }
+    }
+
+
+    public class Instance
+    {
+        public int Id { get; private set; }
+
+        public string Name { get; private set; }
+
+        /// <summary>
+        /// The lower limit of threads in the pool.
+        /// </summary>
+        public int MinimumThreads { get; private set; }
+        /// <summary>
+        /// The upper limit of threads in the pool.
+        /// </summary>
+        public int MaximumThreads { get; private set; }
+
+        /// <summary>
+        /// Stats per group.
+        /// </summary>
+        public class SchedulingGroupsStats
+        {
+            private long _enqueued;
+
+            /// <summary />
+            public long Enqueued { get { return _enqueued; } }
+
+            internal SchedulingGroupsStats IncrementEnqueued()
+            {
+                Interlocked.Increment(ref _enqueued);
+                return this;
+            }
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Instance"/> class.
+        /// </summary>
+        /// <param name="id">The id.</param>
+        /// <param name="name">Name of the cache.</param>
+        /// <param name="minimumThreads">The minimum threads.</param>
+        /// <param name="maximumThreads">The maximum threads.</param>
+        public Instance(
+            int id,
+            string name,
+            int minimumThreads,
+            int maximumThreads)
+        {
+            Id = id;
+            Name = name ?? string.Empty;
+            MinimumThreads = minimumThreads;
+            MaximumThreads = maximumThreads;
+        }
+
+        #region Threads
+
+        /// <summary>
+        /// The number of masters.
+        /// </summary>
+        private long _masters;
+        /// <summary>
+        /// The number of slaves.
+        /// </summary>
+        private long _slaves;
+
+        #region Properties
+
+        public long Masters
+        {
+            get
+            {
+                return Interlocked.Read(ref _masters);
+            }
+        }
+
+        public long Slaves
+        {
+            get
+            {
+                return Interlocked.Read(ref _slaves);
+            }
+        }
+
+        #endregion
+
+        #region Register/Unregister
+
+        /// <summary>
+        /// Registers a master thread.
+        /// </summary>
+        /// <param name="master">if set to <c>true</c> [master].</param>
+        /// <returns></returns>
+        internal long RegisterCurrentThread(bool master)
+        {
+            return master ? Interlocked.Increment(ref _masters) : Interlocked.Increment(ref _slaves);
+        }
+
+        /// <summary>
+        /// Unregisters a thread.
+        /// </summary>
+        /// <param name="master">if set to <c>true</c> [master].</param>
+        /// <returns></returns>
+        internal long UnregisterCurrentThread(bool master)
+        {
+            return master ? Interlocked.Decrement(ref _masters) : Interlocked.Decrement(ref _slaves);
+        }
+
+        #endregion
+
+        #endregion
+
+        #region Tasks
+
+        /// <summary>
+        /// The number of sleepers.
+        /// </summary>
+        private long _sleepers;
+
+        /// <summary>
+        /// The number of workers.
+        /// </summary>
+        private long _workers;
+
+        /// <summary>
+        /// Maximum numbers of sleepers encountered.
+        /// </summary>
+        private long _highWatermark;
+
+        #region Properties
+
+        /// <summary>
+        /// Gets the number of sleepers.
+        /// </summary>
+        public long Sleepers
+        {
+            get
+            {
+                return Interlocked.Read(ref _sleepers);
+            }
+        }
+
+        /// <summary>
+        /// Gets the number of workers.
+        /// </summary>
+        public long Workers
+        {
+            get
+            {
+                return Interlocked.Read(ref _workers);
+            }
+        }
+
+        /// <summary>
+        /// Maximum number of sleepers having been waiting in the
+        /// queue. Approximative value.
+        /// </summary>
+        public long HighWatermark
+        {
+            get
+            {
+                return Interlocked.Read(ref _highWatermark);
+            }
+        }
+
+        /// <summary>
+        /// Stats on scheduling groups.
+        /// </summary>
+        public IEnumerable<KeyValuePair<SchedulingGroup, SchedulingGroupsStats>> GroupsStats
+        {
+            get { return _groupStats; }
+        }
+
+        #endregion
+
+        #region Increment/Decrement
+
+        /// <summary>
+        /// Increments the number of sleepers.
+        /// </summary>
+        /// <returns></returns>
+        public long IncrementSleepers()
+        {
+            long s = Interlocked.Increment(ref _sleepers);
+            // don't care about race conditions, we need only
+            // approximate values.
+            if (s > _highWatermark) _highWatermark = s;
+            return s;
+        }
+        /// <summary>
+        /// Decrements the number of sleepers.
+        /// </summary>
+        /// <returns></returns>
+        public long DecrementSleepers()
+        {
+            return Interlocked.Decrement(ref _sleepers);
+        }
+
+        /// <summary>
+        /// Increments the number of workers.
+        /// </summary>
+        /// <returns></returns>
+        public long IncrementWorkers()
+        {
+            return Interlocked.Increment(ref _workers);
+        }
+        /// <summary>
+        /// Decrements the number of workers.
+        /// </summary>
+        /// <returns></returns>
+        public long DecrementWorkers()
+        {
+            return Interlocked.Decrement(ref _workers);
+        }
+
+        public long IncrementCancelSuccesses()
+        {
+            return Interlocked.Increment(ref _cancelSuccesses);
+        }
+
+        public long IncrementCancelFailures()
+        {
+            return Interlocked.Increment(ref _cancelFailures);
+        }
+
+        internal SchedulingGroupsStats IncrementForGroup(SchedulingGroup group)
+        {
+            return _groupStats.AddOrUpdate(group, dummy => new SchedulingGroupsStats().IncrementEnqueued(), (g, s) => s.IncrementEnqueued());
+        }
+
+        #endregion
+
+        #endregion
+
+        #region Timing
+
+        #region Waiting
+
+        /// <summary>
+        /// The number of waiting.
+        /// </summary>
+        private long _waitingCount;
+        /// <summary>
+        /// The total of waiting time.
+        /// </summary>
+        private long _waitingDelay;
+        /// <summary>
+        /// Successfully canceled workers.
+        /// </summary>
+        private long _cancelSuccesses;
+        /// <summary>
+        /// Cancel requests on workers that were already running.
+        /// </summary>
+        private long _cancelFailures;
+
+        /// <summary>
+        /// The waiting lock.
+        /// </summary>
+        private readonly object _waitingLock = new object();
+        /// <summary>
+        /// The last waiting time.
+        /// </summary>
+        private double _waitingFlow;
+
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<SchedulingGroup, SchedulingGroupsStats> _groupStats = new System.Collections.Concurrent.ConcurrentDictionary<SchedulingGroup, SchedulingGroupsStats>();
+
+        #region Properties
+
+        /// <summary>
+        /// Gets the number of waiting.
+        /// </summary>
+        public long WaitingCount
+        {
+            get
+            {
+                return Interlocked.Read(ref _waitingCount);
+            }
+        }
+        /// <summary>
+        /// Gets the waiting delay.
+        /// </summary>
+        public long WaitingDelay
+        {
+            get
+            {
+                return Interlocked.Read(ref _waitingDelay);
+            }
+        }
+
+        /// <summary>
+        /// Successfully canceled workers.
+        /// </summary>
+        public long CancelSuccesses { get { return _cancelSuccesses; } }
+        /// <summary>
+        /// Cancel requests on workers that were already running.
+        /// </summary>
+        public long CancelFailures { get { return _cancelFailures; } }
+
+        /// <summary>
+        /// Gets the waiting flow.
+        /// </summary>
+        public double WaitingFlow
+        {
+            get
+            {
+                lock (_waitingLock)
+                {
+                    return _waitingFlow / 10.0;
+                }
+            }
+        }
+
+        #endregion
+
+        #region Update
+
+        /// <summary>
+        /// Updates the waiting.
+        /// </summary>
+        /// <param name="startTick">The start tick.</param>
+        /// <param name="endTick">The end tick.</param>
+        public void UpdateWaiting(int startTick, int endTick)
+        {
+            int delay = unchecked(endTick - startTick);
+            if (delay < 0)
+            {
+                delay = 1 - delay;
+            }
+            Interlocked.Increment(ref _waitingCount);
+            Interlocked.Add(ref _waitingDelay, delay);
+            lock (_waitingLock)
+            {
+                _waitingFlow = _waitingFlow * 0.9 + delay;
+            }
+        }
+
+        #endregion
+
+        #endregion
+
+        #region Running
+
+        /// <summary>
+        /// The number of running.
+        /// </summary>
+        private long _runningCount;
+        /// <summary>
+        /// The total of running time.
+        /// </summary>
+        private long _runningDelay;
+
+        /// <summary>
+        /// The running lock.
+        /// </summary>
+        private readonly object _runningLock = new object();
+        /// <summary>
+        /// The last running time.
+        /// </summary>
+        private double _runningFlow;
+
+        #region Properties
+
+        /// <summary>
+        /// Gets the number of running.
+        /// </summary>
+        public long RunningCount
+        {
+            get
+            {
+                return Interlocked.Read(ref _runningCount);
+            }
+        }
+        /// <summary>
+        /// Gets the running delay.
+        /// </summary>
+        public long RunningDelay
+        {
+            get
+            {
+                return Interlocked.Read(ref _runningDelay);
+            }
+        }
+
+        /// <summary>
+        /// Gets the running flow.
+        /// </summary>
+        public double RunningFlow
+        {
+            get
+            {
+                lock (_runningLock)
+                {
+                    return _runningFlow / 10.0;
+                }
+            }
+        }
+
+        #endregion
+
+        #region Update
+
+        /// <summary>
+        /// Updates the running.
+        /// </summary>
+        /// <param name="startTick">The start tick.</param>
+        /// <param name="endTick">The end tick.</param>
+        public void UpdateRunning(int startTick, int endTick)
+        {
+            int delay = unchecked(endTick - startTick);
+            if (delay < 0)
+            {
+                delay = 1 - delay;
+            }
+            Interlocked.Increment(ref _runningCount);
+            Interlocked.Add(ref _runningDelay, delay);
+            lock (_runningLock)
+            {
+                _runningFlow = _runningFlow * 0.9 + delay;
+            }
+        }
+
+        #endregion
+
+        #endregion
+
+        #endregion
+
+        /// <summary>
+        /// Returns a <see cref="T:System.String"></see> that represents the current <see cref="T:System.Object"></see>.
+        /// </summary>
+        /// <returns>
+        /// A <see cref="T:System.String"></see> that represents the current <see cref="T:System.Object"></see>.
+        /// </returns>
+        public override string ToString()
+        {
+            return
+                string.Format(
+                    @"SmartThreadPool[{0}, ""{1}""]",
+                    Id,
+                    Name);
+        }
+
+    }
+
+    public class SchedulingGroup : IEquatable<SchedulingGroup>
+    {
+        /// <summary>
+        /// A scheduling group with a weight of 1.
+        /// You should always use this constructor unless
+        /// you really know what you're doing.
+        /// </summary>
+        public SchedulingGroup(string name) : this(name, 1)
+        {
+        }
+
+        /// <summary>
+        /// A scheduling group with the given weight
+        /// Unless you really know what you're doing you should always
+        /// use the default weight.
+        /// </summary>
+        /// <param name="name">Friendly name of the group.</param>
+        /// <param name="weight">Group weight.</param>
+        public SchedulingGroup(string name, int weight)
+        {
+            if (weight <= 0) throw new ArgumentOutOfRangeException("weight", weight, "'weight' cannot be <= 0");
+            _name = name ?? "[Unnamed group]";
+            _groups = new int[weight];
+            for (int i = 0; i < _groups.Length; ++i)
+                _groups[i] = Interlocked.Increment(ref _nextGroup);
+        }
+
+        [ThreadStatic]
+        private static Random _tlrng;
+
+        /// <summary>
+        /// The underlying group to be passed as scheduling group
+        /// to STP QueueWorkItem calls. Must be evaluated for each call.
+        /// </summary>
+        public int Group
+        {
+            get
+            {
+                if (_groups.Length == 1)
+                {
+                    return _groups[0];
+                }
+
+                if (_tlrng == null)
+                {
+                    _tlrng = new Random();
+                }
+
+                return _groups[_tlrng.Next(_groups.Length)];
+            }
+        }
+
+        /// <summary>
+        /// Weight of this group
+        /// </summary>
+        public int Weight
+        {
+            get { return _groups.Length; }
+        }
+
+        /// <summary>
+        /// The friendly name of the group.
+        /// </summary>
+        public string Name
+        {
+            get { return _name; }
+        }
+
+        /// <summary>
+        /// Complete string representation of the scheduling group
+        /// with weights and ID.
+        /// </summary>
+        /// <returns />
+        public override string ToString()
+        {
+            return string.Format("{0} [#{1} - W:{2}]", _name, _groups[0], _groups.Length);
+        }
+
+        private readonly int[] _groups;
+        private readonly string _name;
+
+        private static int _nextGroup = 9999;
+
+        #region Equals and GetHashCode implementation
+        public bool Equals(SchedulingGroup other)
+        {
+            return _groups[0] == other._groups[0];
+        }
+
+        public override bool Equals(object obj)
+        {
+            SchedulingGroup other = obj as SchedulingGroup;
+            if (other == null)
+                return false;
+            return Equals(other);
+        }
+
+        public override int GetHashCode()
+        {
+            return _groups[0];
+        }
+
+        public static bool operator ==(SchedulingGroup lhs, SchedulingGroup rhs)
+        {
+            if (ReferenceEquals(lhs, rhs))
+                return true;
+            if (ReferenceEquals(lhs, null) || ReferenceEquals(rhs, null))
+                return false;
+            return lhs.Equals(rhs);
+        }
+
+        public static bool operator !=(SchedulingGroup lhs, SchedulingGroup rhs)
+        {
+            return !(lhs == rhs);
+        }
+
+        #endregion
+    }
+
+    public interface IWorkItemResult
+    {
+        /// <summary>
+        /// Waits this instance.
+        /// </summary>
+        /// <returns></returns>
+        bool Wait();
+
+        /// <summary>
+        /// Waits the specified timeout.
+        /// </summary>
+        /// <param name="timeout">The timeout.</param>
+        /// <returns></returns>
+        bool Wait(TimeSpan timeout);
+
+        /// <summary>
+        /// Waits the specified milliseconds timeout.
+        /// </summary>
+        /// <param name="millisecondsTimeout">The milliseconds timeout.</param>
+        /// <returns></returns>
+        bool Wait(
+            int millisecondsTimeout);
+
+        /// <summary>
+        /// Gets an indication whether the asynchronous operation has completed.
+        /// </summary>
+        bool IsCompleted { get; }
+
+        /// <summary>
+        /// Gets an indication whether the asynchronous operation has been canceled.
+        /// </summary>
+        bool IsCanceled { get; }
+
+        /// <summary>
+        /// Cancel the work item if it didn't start running yet.
+        /// </summary>
+        /// <returns>Returns true on success or false if the work item is in progress or already completed</returns>
+        bool Cancel();
+
+        /// <summary>
+        /// Returns the exception if occured otherwise returns null.
+        /// </summary>
+        Exception Exception { get; }
+    }
+
+    internal class WorkItemQueue : IDisposable
+    {
+        /// <summary>
+        /// The work item queue.
+        /// </summary>
+        private readonly FairQueue<BaseWorkItem> _workItemQueue = new FairQueue<BaseWorkItem>();
+
+        /// <summary>
+        /// Enqueues the specified work item.
+        /// </summary>
+        /// <param name="workItem">The work item.</param>
+        /// <param name="group">Fair scheduling group.</param>
+        public void Enqueue(BaseWorkItem workItem, int group)
+        {
+            if (workItem == null)
+            {
+                throw new ArgumentNullException("workItem");
+            }
+
+            if (!_disposed)
+            {
+                lock (_workItemQueue)
+                {
+                    if (!_disposed)
+                    {
+                        _workItemQueue.Enqueue(group, workItem);
+                        Monitor.Pulse(_workItemQueue);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Dequeues a work item.
+        /// </summary>
+        /// <returns></returns>
+        public BaseWorkItem Dequeue()
+        {
+            return Dequeue(-1);
+        }
+
+        /// <summary>
+        /// Dequeues a work item.
+        /// </summary>
+        /// <param name="millisecondsTimeout">The milliseconds timeout.</param>
+        /// <returns></returns>
+        public BaseWorkItem Dequeue(int millisecondsTimeout)
+        {
+            if (!_disposed)
+            {
+                lock (_workItemQueue)
+                {
+                    if (!_disposed && _workItemQueue.Count > 0)
+                    {
+                        return _workItemQueue.Dequeue();
+                    }
+
+                    if (Monitor.Wait(_workItemQueue, millisecondsTimeout) && !_disposed && _workItemQueue.Count > 0)
+                    {
+                        return _workItemQueue.Dequeue();
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        #region IDisposable
+
+        /// <summary>
+        /// A flag indicating if disposed.
+        /// </summary>
+        private bool _disposed;
+
+        /// <summary>
+        /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
+        /// </summary>
+        public virtual void Dispose()
+        {
+            //  Disposes managed and unmanaged resources
+            Dispose(true);
+
+            //  Suppress the finalize
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Releases unmanaged resources and performs other cleanup operations before the
+        /// <see cref="WorkItemQueue"/> is reclaimed by garbage collection.
+        /// </summary>
+        ~WorkItemQueue()
+        {
+            //  Disposes unmanaged resources
+            Dispose(false);
+        }
+
+        /// <summary>
+        /// Releases unmanaged and - optionally - managed resources
+        /// </summary>
+        /// <param name="disposing"><c>true</c> to release both managed and unmanaged resources; <c>false</c> to release only unmanaged resources.</param>
+        protected virtual void Dispose(bool disposing)
+        {
+            //  Checks the disposed flag
+            if (!_disposed)
+            {
+                _disposed = true;
+
+                //  Disposes the managed resources
+                if (disposing)
+                {
+                    try
+                    {
+                        //  Clears the queue
+                        lock (_workItemQueue)
+                        {
+                            while (_workItemQueue.Count > 0)
+                            {
+                                var workItem = _workItemQueue.Dequeue();
+                                workItem.Cancel();
+                            }
+
+                            Monitor.PulseAll(_workItemQueue);
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        #endregion
+    }
+
+    public class FairQueue<TData>
+    {
+        /// <summary>
+        /// Enqueue some data. O(1) operation.
+        /// </summary>
+        /// <param name="tag">Tag associated to the data.</param>
+        /// <param name="data">Data to enqueue.</param>
+        public void Enqueue(int tag, TData data)
+        {
+            LinkedQueue tagged;
+            if (!_queues.TryGetValue(tag, out tagged))
+            {
+                tagged = new LinkedQueue(tag, new Queue<TData>());
+                _queues[tag] = tagged;
+            }
+            if (tagged.Content.Count == 0)
+            {
+                if (_tail != null)
+                {
+                    _tail.Next = tagged;
+                    _tail = tagged;
+                }
+                else
+                {
+                    _head = _tail = tagged;
+                }
+            }
+            tagged.Content.Enqueue(data);
+            ++_count;
+        }
+
+        /// <summary>
+        /// Enqueue some data associated to tag 0. O(1) operation.
+        /// </summary>
+        /// <param name="data">Data to enqueue.</param>
+        public void Enqueue(TData data)
+        {
+            Enqueue(0, data);
+        }
+
+        /// <summary>
+        /// Dequeue some data. You cannot predict the tag the next dequeued data belongs to, but data belonging
+        /// to the same tag is guaranteed to come out in fifo order.
+        /// O(1) operation.
+        /// </summary>
+        /// <returns>Dequeued data.</returns>
+        public TData Dequeue()
+        {
+            int tag;
+            return Dequeue(out tag);
+        }
+
+        /// <summary>
+        /// Dequeue some data. You cannot predict the tag the next dequeued data belongs to, but data belonging
+        /// to the same tag is guaranteed to come out in fifo order.
+        /// O(1) operation.
+        /// </summary>
+        /// <param name="tag">The tag to which the data belonged to.</param>
+        /// <returns>Dequeued data.</returns>
+        public TData Dequeue(out int tag)
+        {
+            if (_head == null) throw new InvalidOperationException("Trying to dequeue from an empty FairQueue.");
+
+            var data = _head.Content.Dequeue();
+            tag = _head.Tag;
+
+            var oldHead = _head;
+            if (oldHead != _tail)
+            {
+                _head = oldHead.Next;
+                oldHead.Next = null;
+                if (oldHead.Content.Count != 0)
+                {
+                    _tail.Next = oldHead;
+                    _tail = oldHead;
+                }
+            }
+            else
+            {
+                if (oldHead.Content.Count == 0)
+                {
+                    _head = _tail = null;
+                }
+            }
+
+            --_count;
+            return data;
+        }
+
+        /// <summary>
+        /// Number of elements in the FairQueue.
+        /// O(1) operation.
+        /// </summary>
+        public int Count
+        {
+            get
+            {
+                return _count;
+            }
+        }
+
+        /// <summary>
+        /// Number of elements associated to a given tag in the FairQueue.
+        /// O(1) operation.
+        /// </summary>
+        /// <param name="tag">The tag to count elements from.</param>
+        /// <returns>Number of elements associated to the given tag.</returns>
+        public int CountTagged(int tag)
+        {
+            return _queues[tag].Content.Count;
+        }
+
+        /// <summary>
+        /// Returns true if the FairQueue is empty, false otherwise.
+        /// O(1) operation.
+        /// </summary>
+        public bool Empty
+        {
+            get
+            {
+                return Count == 0;
+            }
+        }
+
+        /// <summary>
+        /// Basic linked list of queues to round robin order the dequeing operations.
+        /// </summary>
+        private class LinkedQueue
+        {
+            public LinkedQueue(int tag, Queue<TData> self)
+            {
+                Tag = tag;
+                Content = self;
+            }
+
+            public readonly int Tag;
+            public readonly Queue<TData> Content;
+            public LinkedQueue Next;
+        }
+
+        private readonly Dictionary<int, LinkedQueue> _queues = new Dictionary<int, LinkedQueue>();
+        private LinkedQueue _head;
+        private LinkedQueue _tail;
+        private int _count;
+    }
+
+
+
+
 }
