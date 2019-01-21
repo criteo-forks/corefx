@@ -1954,7 +1954,7 @@ namespace System.Net.Sockets
         public static string IdOf(object o) => o == null ? "(null)" : $"{o.GetType().Name}#{o.GetHashCode():X2}";
     }
 
-    public class FixedSizeThreadPool
+    internal class FixedSizeThreadPool
     {
         private readonly System.Collections.Concurrent.ConcurrentQueue<WorkItem> _queue;
 
@@ -1969,7 +1969,7 @@ namespace System.Net.Sockets
             }
         }
 
-        public void Enqueue(WaitCallback callback, object state)
+        public void QueueWorkItem(WaitCallback callback, object state)
         {
             _queue.Enqueue(new WorkItem(callback, state));
 
@@ -1987,10 +1987,9 @@ namespace System.Net.Sockets
                 {
                     lock (_queue)
                     {
-                        if (!_queue.TryDequeue(out item))
+                        while (!_queue.TryDequeue(out item))
                         {
                             Monitor.Wait(_queue);
-                            continue;
                         }
                     }
                 }
