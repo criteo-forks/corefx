@@ -52,17 +52,44 @@ internal static partial class Interop
         [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes128Cbc")]
         internal static extern IntPtr EvpAes128Cbc();
 
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes128Cfb1")]
+        internal static extern IntPtr EvpAes128Cfb1();
+
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes128Cfb8")]
+        internal static extern IntPtr EvpAes128Cfb8();
+
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes128Cfb128")]
+        internal static extern IntPtr EvpAes128Cfb128();
+
         [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes192Ecb")]
         internal static extern IntPtr EvpAes192Ecb();
 
         [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes192Cbc")]
         internal static extern IntPtr EvpAes192Cbc();
 
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes192Cfb1")]
+        internal static extern IntPtr EvpAes192Cfb1();
+
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes192Cfb8")]
+        internal static extern IntPtr EvpAes192Cfb8();
+
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes192Cfb128")]
+        internal static extern IntPtr EvpAes192Cfb128();
+
         [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes256Ecb")]
         internal static extern IntPtr EvpAes256Ecb();
 
         [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes256Cbc")]
         internal static extern IntPtr EvpAes256Cbc();
+
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes256Cfb1")]
+        internal static extern IntPtr EvpAes256Cfb1();
+
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes256Cfb8")]
+        internal static extern IntPtr EvpAes256Cfb8();
+
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpAes256Cfb128")]
+        internal static extern IntPtr EvpAes256Cfb128();
 
         [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpDesCbc")]
         internal static extern IntPtr EvpDesCbc();
@@ -72,6 +99,9 @@ internal static partial class Interop
 
         [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpDes3Cbc")]
         internal static extern IntPtr EvpDes3Cbc();
+
+        [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpDes3Cfb")]
+        internal static extern IntPtr EvpDes3Cfb();
 
         [DllImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpDes3Ecb")]
         internal static extern IntPtr EvpDes3Ecb();

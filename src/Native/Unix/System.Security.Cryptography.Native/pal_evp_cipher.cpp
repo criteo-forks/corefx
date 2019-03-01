@@ -128,6 +128,21 @@ extern "C" const EVP_CIPHER* CryptoNative_EvpAes128Cbc()
     return EVP_aes_128_cbc();
 }
 
+extern "C" const EVP_CIPHER* CryptoNative_EvpAes128Cfb1()
+{
+    return EVP_aes_128_cfb1();
+}
+
+extern "C" const EVP_CIPHER* CryptoNative_EvpAes128Cfb8()
+{
+    return EVP_aes_128_cfb8();
+}
+
+extern "C" const EVP_CIPHER* CryptoNative_EvpAes128Cfb128()
+{
+    return EVP_aes_128_cfb128();
+}
+
 extern "C" const EVP_CIPHER* CryptoNative_EvpAes192Ecb()
 {
     return EVP_aes_192_ecb();
@@ -138,6 +153,21 @@ extern "C" const EVP_CIPHER* CryptoNative_EvpAes192Cbc()
     return EVP_aes_192_cbc();
 }
 
+extern "C" const EVP_CIPHER* CryptoNative_EvpAes192Cfb1()
+{
+    return EVP_aes_192_cfb1();
+}
+
+extern "C" const EVP_CIPHER* CryptoNative_EvpAes192Cfb8()
+{
+    return EVP_aes_192_cfb8();
+}
+
+extern "C" const EVP_CIPHER* CryptoNative_EvpAes192Cfb128()
+{
+    return EVP_aes_192_cfb128();
+}
+
 extern "C" const EVP_CIPHER* CryptoNative_EvpAes256Ecb()
 {
     return EVP_aes_256_ecb();
@@ -146,6 +176,21 @@ extern "C" const EVP_CIPHER* CryptoNative_EvpAes256Ecb()
 extern "C" const EVP_CIPHER* CryptoNative_EvpAes256Cbc()
 {
     return EVP_aes_256_cbc();
+}
+
+extern "C" const EVP_CIPHER* CryptoNative_EvpAes256Cfb1()
+{
+    return EVP_aes_256_cfb1();
+}
+
+extern "C" const EVP_CIPHER* CryptoNative_EvpAes256Cfb8()
+{
+    return EVP_aes_256_cfb8();
+}
+
+extern "C" const EVP_CIPHER* CryptoNative_EvpAes256Cfb128()
+{
+    return EVP_aes_256_cfb128();
 }
 
 extern "C" const EVP_CIPHER* CryptoNative_EvpDesEcb()
@@ -166,6 +211,11 @@ extern "C" const EVP_CIPHER* CryptoNative_EvpDes3Ecb()
 extern "C" const EVP_CIPHER* CryptoNative_EvpDes3Cbc()
 {
     return EVP_des_ede3_cbc();
+}
+
+extern "C" const EVP_CIPHER* CryptoNative_EvpDes3Cfb()
+{
+    return EVP_des_ede3_cfb8();
 }
 
 extern "C" const EVP_CIPHER* CryptoNative_EvpRC2Ecb()
