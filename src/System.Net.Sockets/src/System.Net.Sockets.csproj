@@ -396,6 +396,7 @@
     <Reference Include="System.Threading" />
     <Reference Include="System.Threading.Overlapped" />
     <Reference Include="System.Threading.Tasks" />
+    <Reference Include="System.Threading.Thread" />
     <Reference Include="System.Threading.ThreadPool" />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetsUnix)' == 'true'">
