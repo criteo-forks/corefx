@@ -1963,7 +1963,7 @@ namespace System.Net.Sockets
         private readonly ConcurrentQueue<(WaitCallback callback, object state)> _queue;
         private readonly ConcurrentStack<Worker> _pendingWorkers;
 
-        private int _lastTickCount;
+        private long _lastTickCount;
 
         public DynamicThreadPool(int minSize)
         {
@@ -2024,7 +2024,7 @@ namespace System.Net.Sockets
 
             while (true)
             {
-                var tickCount = Environment.TickCount;
+                var tickCount = Environment.TickCount64;
                 var lastTickCount = _lastTickCount;
 
                 // Make sure enough time elapsed since we last started a worker
