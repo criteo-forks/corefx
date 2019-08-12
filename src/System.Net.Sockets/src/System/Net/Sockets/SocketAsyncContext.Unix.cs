@@ -2024,7 +2024,7 @@ namespace System.Net.Sockets
 
             while (true)
             {
-                var tickCount = Environment.TickCount64;
+                long tickCount = System.DateTime.UtcNow.Ticks / 10000;
                 var lastTickCount = _lastTickCount;
 
                 // Make sure enough time elapsed since we last started a worker
