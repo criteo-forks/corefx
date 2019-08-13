@@ -148,7 +148,7 @@ namespace System
         }
 
         public static int TickCount => EnvironmentAugments.TickCount;
-        public static int TickCount64 => EnvironmentAugments.TickCount64;
+        public static long TickCount64 => EnvironmentAugments.TickCount64;
 
         public static bool UserInteractive => true;
 
